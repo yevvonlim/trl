@@ -17,23 +17,21 @@ import base64
 import copy
 import logging
 import socket
-import time
 from io import BytesIO
 from urllib.parse import urlparse
+import time
 
 import torch
 import torch.distributed.distributed_c10d as c10d
-from requests.adapters import HTTPAdapter
 from torch import nn
 from transformers import is_torch_xpu_available
-from urllib3.util.retry import Retry
 
 from ..import_utils import is_requests_available, is_vllm_ascend_available, is_vllm_available
 
 
 if is_requests_available():
     import requests
-    from requests import ConnectionError
+    from requests import ConnectionError, Timeout, ReadTimeout
 
 
 if is_vllm_available():
@@ -131,24 +129,6 @@ class VLLMClient:
 
         self.session = requests.Session()
 
-        # Configure retries for HTTP requests made through this session.
-        # This is not strictly required for correctness, but it helps make training more robust to rare, transient
-        # failures (network hiccups, temporary 5xx errors, overloaded servers). Without this, such failures could cause
-        # an otherwise healthy training run to fail.
-        retry_strategy = Retry(
-            total=5,  # global cap on the total number of retries across all failure types
-            connect=5,  # retry connection-level failures (DNS issues, refused connections, etc)
-            read=5,  # retry failures while reading the response after the connection was successfully established
-            status=3,  # retry a limited number of times when we receive certain HTTP error responses from the server
-            status_forcelist=[500, 502, 503],  # only retry on server-side errors that are usually temporary
-            backoff_factor=2,  # exponential backoff between retries (2s, 4s, 8s, ...)
-            allowed_methods=["POST", "GET"],  # allow POST as well, even though we're not sure it's safe here
-        )
-
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-
         if base_url is not None:
             # Parse the base_url to extract host and port
             parsed_url = urlparse(base_url)
@@ -212,80 +192,80 @@ class VLLMClient:
         truncate_prompt_tokens: int | None = None,
         structured_outputs_regex: str | None = None,
         generation_kwargs: dict | None = None,
+        # Added parameters for retry logic
+        max_retries: int = 3,
+        retry_delay: float = 2.0,
+        request_timeout: int = 300, 
     ) -> dict[str, list[list[int]]]:
         """
-        Generates model completions for the provided prompts.
-
-        Args:
-            prompts (`list[str]`):
-                List of text prompts for which the model will generate completions.
-            images (`list[PIL.Image]`, *optional*):
-                List of PIL Images to send along with the prompts.
-            n (`int`, *optional*, defaults to `1`):
-                Number of completions to generate for each prompt.
-            repetition_penalty (`float`, *optional*, defaults to `1.0`):
-                Parameter for repetition penalty. 1.0 means no penalty.
-            temperature (`float`, *optional*, defaults to `1.0`):
-                Temperature parameter for sampling. Higher values increase diversity.
-            top_p (`float`, *optional*, defaults to `1.0`):
-                Top-p sampling parameter.`1.0` means no truncation.
-            top_k (`int`, *optional*, defaults to `-1`):
-                Top-k sampling parameter. `-1` means no truncation.
-            min_p (`float`, *optional*, defaults to `0.0`):
-                Minimum probability for sampling.
-            max_tokens (`int`, *optional*, defaults to `16`):
-                Maximum number of tokens to generate for each prompt.
-            truncate_prompt_tokens (`int`, *optional*):
-                If set to `-1`, will use the truncation size supported by the model. If set to an integer k, will use
-                only the last k tokens from the prompt (i.e., left truncation). If set to `None`, truncation is
-                disabled.
-            structured_outputs_regex (`str`, *optional*):
-                Regular expression to guide the decoding process.
-            generation_kwargs (`dict`, *optional*):
-                Additional generation parameters to pass to the vLLM `SamplingParams`. This can include parameters like
-                `seed`, `frequency_penalty`, etc. If it contains keys that conflict with the other parameters, they
-                will override them.
-
-        Returns:
-            `dict` with keys:
-                - `prompt_ids` (`list[list[int]]`):
-                    List of lists of token IDs representing the tokenized input prompts.
-                - `completion_ids` (`list[list[int]]`):
-                    List of lists of token IDs representing the model-generated completions for each prompt.
-                - `logprobs` (`list[list[float]]`):
-                    List of lists of log probabilities for each generated token.
+        Generates model completions with robust error handling for connection resets (Error 104).
         """
         url = f"{self.base_url}/generate/"
 
         # Convert PIL images to base64 strings
         images = [pil_to_base64(img) for img in images] if images else None
+        
+        payload = {
+            "prompts": prompts,
+            "images": images,
+            "n": n,
+            "repetition_penalty": repetition_penalty,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "max_tokens": max_tokens,
+            "truncate_prompt_tokens": truncate_prompt_tokens,
+            "structured_outputs_regex": structured_outputs_regex,
+            "generation_kwargs": generation_kwargs or {},
+        }
 
-        response = self.session.post(
-            url,
-            json={
-                "prompts": prompts,
-                "images": images,
-                "n": n,
-                "repetition_penalty": repetition_penalty,
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "min_p": min_p,
-                "max_tokens": max_tokens,
-                "truncate_prompt_tokens": truncate_prompt_tokens,
-                "structured_outputs_regex": structured_outputs_regex,
-                "generation_kwargs": generation_kwargs or {},
-            },
-        )
-        if response.status_code == 200:
-            json_response = response.json()
-            return {
-                "prompt_ids": json_response["prompt_ids"],
-                "completion_ids": json_response["completion_ids"],
-                "logprobs": json_response["logprobs"],
-            }
-        else:
-            raise Exception(f"Request failed: {response.status_code}, {response.text}")
+        for attempt in range(max_retries):
+            try:
+                # Attempt the request with a specific timeout
+                response = self.session.post(
+                    url, 
+                    json=payload, 
+                    timeout=request_timeout
+                )
+                
+                # Case 1: Success
+                if response.status_code == 200:
+                    json_response = response.json()
+                    return {
+                        "prompt_ids": json_response["prompt_ids"],
+                        "completion_ids": json_response["completion_ids"],
+                        "logprobs": json_response["logprobs"],
+                    }
+                
+                # Case 2: Server-side errors (5xx) -> Retry needed
+                elif response.status_code >= 500:
+                    print(f"[Warning] vLLM Server Error {response.status_code}. Retrying ({attempt + 1}/{max_retries})...")
+                    time.sleep(retry_delay)
+                    continue
+                
+                # Case 3: Client-side errors (4xx) -> Do not retry, raise exception immediately
+                else:
+                    raise Exception(f"Request failed: {response.status_code}, {response.text}")
+
+            # Case 4: Network/Connection Errors (including ConnectionResetError 104)
+            except (ConnectionError, Timeout, ReadTimeout) as e:
+                print(f"[Warning] Connection failed: {e}. Retrying ({attempt + 1}/{max_retries})...")
+                
+                # CRITICAL: Close the corrupted session and create a fresh one.
+                # This effectively handles 'Connection reset by peer' by dropping the zombie connection.
+                try:
+                    self.session.close()
+                except Exception:
+                    pass # Ignore errors during close
+                
+                self.session = requests.Session()
+                
+                # Exponential backoff: wait longer for each subsequent failure (e.g., 2s, 4s, 6s)
+                time.sleep(retry_delay * (attempt + 1))
+        
+        # If all attempts fail, raise a final exception
+        raise RuntimeError(f"Failed to generate after {max_retries} attempts due to network or server issues.")
 
     def chat(
         self,
