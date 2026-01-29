@@ -17,9 +17,9 @@ import base64
 import copy
 import logging
 import socket
+import time
 from io import BytesIO
 from urllib.parse import urlparse
-import time
 
 import torch
 import torch.distributed.distributed_c10d as c10d
@@ -31,7 +31,7 @@ from ..import_utils import is_requests_available, is_vllm_ascend_available, is_v
 
 if is_requests_available():
     import requests
-    from requests import ConnectionError, Timeout, ReadTimeout
+    from requests import ConnectionError, ReadTimeout, Timeout
 
 
 if is_vllm_available():
@@ -192,10 +192,9 @@ class VLLMClient:
         truncate_prompt_tokens: int | None = None,
         structured_outputs_regex: str | None = None,
         generation_kwargs: dict | None = None,
-        # Added parameters for retry logic
         max_retries: int = 3,
         retry_delay: float = 2.0,
-        request_timeout: int = 300, 
+        request_timeout: int = 300,
     ) -> dict[str, list[list[int]]]:
         """
         Generates model completions with robust error handling for connection resets (Error 104).
@@ -204,7 +203,7 @@ class VLLMClient:
 
         # Convert PIL images to base64 strings
         images = [pil_to_base64(img) for img in images] if images else None
-        
+
         payload = {
             "prompts": prompts,
             "images": images,
@@ -223,13 +222,8 @@ class VLLMClient:
         for attempt in range(max_retries):
             try:
                 # Attempt the request with a specific timeout
-                response = self.session.post(
-                    url, 
-                    json=payload, 
-                    timeout=request_timeout
-                )
-                
-                # Case 1: Success
+                response = self.session.post(url, json=payload, timeout=request_timeout)
+
                 if response.status_code == 200:
                     json_response = response.json()
                     return {
@@ -237,33 +231,26 @@ class VLLMClient:
                         "completion_ids": json_response["completion_ids"],
                         "logprobs": json_response["logprobs"],
                     }
-                
-                # Case 2: Server-side errors (5xx) -> Retry needed
+
                 elif response.status_code >= 500:
-                    print(f"[Warning] vLLM Server Error {response.status_code}. Retrying ({attempt + 1}/{max_retries})...")
                     time.sleep(retry_delay)
                     continue
-                
-                # Case 3: Client-side errors (4xx) -> Do not retry, raise exception immediately
+
                 else:
                     raise Exception(f"Request failed: {response.status_code}, {response.text}")
 
-            # Case 4: Network/Connection Errors (including ConnectionResetError 104)
-            except (ConnectionError, Timeout, ReadTimeout) as e:
-                print(f"[Warning] Connection failed: {e}. Retrying ({attempt + 1}/{max_retries})...")
-                
-                # CRITICAL: Close the corrupted session and create a fresh one.
+            except (ConnectionError, Timeout, ReadTimeout):
                 # This effectively handles 'Connection reset by peer' by dropping the zombie connection.
                 try:
                     self.session.close()
                 except Exception:
-                    pass # Ignore errors during close
-                
+                    pass  # Ignore errors during close
+
                 self.session = requests.Session()
-                
+
                 # Exponential backoff: wait longer for each subsequent failure (e.g., 2s, 4s, 6s)
                 time.sleep(retry_delay * (attempt + 1))
-        
+
         # If all attempts fail, raise a final exception
         raise RuntimeError(f"Failed to generate after {max_retries} attempts due to network or server issues.")
 
